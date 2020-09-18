@@ -1,0 +1,65 @@
+XXXXLOG.TXT
+Logging started at 09/17/2020 12:51:46
+List selection updated to 1100 0000 0000 0000 at 09/17/2020 12:52:00
+Logging started at 09/17/2020 12:53:16
+Logging started at 09/17/2020 12:54:04
+List selection updated to 0011 0000 0000 0000 at 09/17/2020 12:55:00
+List selection updated to 1110 0000 0000 0000 at 09/17/2020 12:56:00
+List selection updated to 0011 0000 0000 0000 at 09/17/2020 12:57:00
+List selection updated to 1111 1111 1111 1111 at 09/17/2020 12:58:00
+List selection updated to 0100 0000 0000 0000 at 09/17/2020 12:59:00
+List selection updated to 1100 0000 0000 0000 at 09/17/2020 13:00:00
+List selection updated to 1000 0000 0000 0001 at 09/17/2020 13:01:00
+List selection updated to 1101 0000 0000 0000 at 09/17/2020 13:02:00
+List selection updated to 0011 0000 0000 0000 at 09/17/2020 13:03:00
+List selection updated to 1111 0000 0000 0000 at 09/17/2020 13:04:00
+List selection updated to 1100 0000 0000 0000 at 09/17/2020 13:05:00
+List selection updated to 1000 0000 0000 0001 at 09/17/2020 13:06:00
+List selection updated to 1111 1111 1111 1111 at 09/17/2020 13:07:00
+List selection updated to 0011 0000 1111 0000 at 09/17/2020 13:08:00
+List selection updated to 1110 0000 0000 0000 at 09/17/2020 13:09:00
+List selection updated to 0011 0000 0000 0000 at 09/17/2020 13:10:00
+List selection updated to 1111 0000 0000 0000 at 09/17/2020 13:11:00
+List selection updated to 1100 0000 0000 0000 at 09/17/2020 13:12:00
+List selection updated to 1000 0000 0000 0001 at 09/17/2020 13:13:00
+List selection updated to 1100 0000 0000 0000 at 09/17/2020 13:14:00
+List selection updated to 0011 0000 0000 0000 at 09/17/2020 13:15:00
+List selection updated to 1110 0000 0000 0000 at 09/17/2020 13:16:00
+List selection updated to 0011 0000 0000 0000 at 09/17/2020 13:17:00
+List selection updated to 1111 1111 1111 1111 at 09/17/2020 13:18:00
+Logging started at 09/18/2020 10:05:26
+GPS calibration: Time updated from 09/18/2020 10:05:52 to 09/18/2020 10:05:52
+List selection updated to 1000 0000 0000 0000 at 09/18/2020 10:06:00
+List selection updated to 0100 0000 0000 0000 at 09/18/2020 10:07:00
+List selection updated to 0010 0000 0000 0000 at 09/18/2020 10:08:00
+GPS calibration: Time updated from 09/18/2020 10:08:26 to 09/18/2020 10:08:27
+List selection updated to 0001 0000 0000 0001 at 09/18/2020 10:09:00
+List selection updated to 1111 0000 0000 0000 at 09/18/2020 10:10:00
+GPS calibration: Time updated from 09/18/2020 10:10:49 to 09/18/2020 10:10:49
+List selection updated to 1000 0000 0000 0000 at 09/18/2020 10:11:00
+List selection updated to 0100 0000 0000 0000 at 09/18/2020 10:12:00
+List selection updated to 0010 0000 0000 0000 at 09/18/2020 10:13:00
+GPS calibration: Time updated from 09/18/2020 10:13:20 to 09/18/2020 10:13:21
+List selection updated to 0001 0000 0000 0001 at 09/18/2020 10:14:00
+List selection updated to 1111 0000 0000 0000 at 09/18/2020 10:15:00
+GPS calibration: Time updated from 09/18/2020 10:15:49 to 09/18/2020 10:15:49
+List selection updated to 1000 0000 0000 0000 at 09/18/2020 10:16:00
+List selection updated to 0100 0000 0000 0000 at 09/18/2020 10:17:00
+GPS calibration: Time updated from 09/18/2020 10:18:18 to 09/18/2020 10:18:19
+GPS calibration: Time updated from 09/18/2020 10:20:47 to 09/18/2020 10:20:48
+GPS calibration: Time updated from 09/18/2020 10:23:21 to 09/18/2020 10:23:21
+GPS calibration: Time updated from 09/18/2020 10:25:54 to 09/18/2020 10:25:54
+GPS calibration: Time updated from 09/18/2020 10:28:17 to 09/18/2020 10:28:18
+GPS calibration: Time updated from 09/18/2020 10:30:48 to 09/18/2020 10:30:48
+GPS calibration: Time updated from 09/18/2020 10:33:19 to 09/18/2020 10:33:19
+GPS calibration: Time updated from 09/18/2020 10:35:50 to 09/18/2020 10:35:50
+GPS calibration: Time updated from 09/18/2020 10:38:18 to 09/18/2020 10:38:19
+GPS calibration: Time updated from 09/18/2020 10:40:50 to 09/18/2020 10:40:50
+GPS calibration: Time updated from 09/18/2020 10:43:17 to 09/18/2020 10:43:18
+GPS calibration: Time updated from 09/18/2020 10:45:53 to 09/18/2020 10:45:53
+GPS calibration: Time updated from 09/18/2020 10:48:19 to 09/18/2020 10:48:19
+GPS calibration: Time updated from 09/18/2020 10:50:47 to 09/18/2020 10:50:48
+Logging started at 09/18/2020 10:00:57
+List selection updated to 0100 0000 0000 0000 at 09/18/2020 10:01:00
+List selection updated to 0010 0000 0000 0000 at 09/18/2020 10:02:00
+List selection updated to 0001 0000 0000 0001 at 09/18/2020 10:03:00
