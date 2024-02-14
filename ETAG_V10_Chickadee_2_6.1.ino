@@ -1,6 +1,7 @@
 /*
   Data logging sketch for the ETAG RFID Reader
   ETAG READER Version 10.0
+  (VKH revision 2.6 02/01/2024)
   PROCESSOR SAMD21J
   USE BOARD DEFINITION: ETAG RFID V2 D21
   Code by:
@@ -13,6 +14,10 @@
   Sept 2019
 
   Licenced in the public domain
+
+  CONSTANTS TO CHECK BEFORE FLASHING:
+  Line 156 "const unsigned int delayTime = X;"
+  Line 171 "const byte motorPresent =  1;"
 
   REQUIREMENTS:
   Power supply for the board should come from the USB cable or a 5V battery or DV power source.
@@ -43,11 +48,23 @@
   Dec 15, 2019 - Changed default mode to no-SD, added LED flash when logging starts
 
   Jan 2020 - incorporated chickadee feeder functions and routines
-  Feb 6, 2020 - added door close failure routine.
+  Feb 2020 - added door close failure routine.
 
   Aug 2020 - changed flash memory addressing to page and byte variables (instead of 4-byte fAddress)
   Aug 2020 - changed RFID storage so that the RF circuit number comes first, this eliminates an addressing problem that could occur if the RFID tag number starts with FF
   Aug 2020 - extensive revision to tag lists. Now tag list are specified by a page address. Byte 0 indicated the number of tags, the rest of the bytes store the tags.
+
+  Sept 2021 - VKH: Added failsafes in case RTC lost battery when loading tag lists. First GPS read after poweron forces a reload of tag lists.
+
+  Sept 2022 - VKH: Cleaned up comments
+
+  Jan 2024 - VKH: Loads of stuff changed that VKH forgot to put in this log:
+             Multiple minor bugfixes
+             Door now waits a short time before closing, will stay open if tag reconnects in that time. 
+               If in A mode, any tag reconnecting will keep the door open.
+               If in T mode, other assigned birds can keep the door open. Non-assigned birds close the door immediately.
+
+  Feb 2024 - Slowed down door when closing (jerky)
 */
 
 
@@ -101,7 +118,7 @@ uint32_t fAddress;                    // Address pointer for logging to backup m
 uint32_t fAddr = 0x800;
 
 String currRFID;                      // stores current RFID number and RF circuit - for use with delayTime
-String pastRFID = "XXXXXXXXXX1";       // stores past RFID number and RF circuit - for use with delayTime
+String pastRFID = "XXXXXXXXXX1";      // stores past RFID number and RF circuit - for use with delayTime
 uint32_t pastHHMMSS;                  // stores the past Hour, Minute and Second - for use with delayTime
 
 //byte tagCount;                        //keeps track of number of stored tags
@@ -122,7 +139,7 @@ String currentDate;                   //Get the current date in mm/dd/yyyy forma
 String currentTime;                   //Get the time
 String currentDateTime;
 String timeString;                    //String for storing the whole date/time line of data
-char incomingByte = 0;                 //Used for incoming serial data
+char incomingByte = 0;                //Used for incoming serial data
 unsigned int timeIn[12];              //Used for incoming serial data during clock setting
 byte menu;
 char feedMode;
@@ -144,20 +161,29 @@ byte RFIDtagArray[5];                 // Stores the five individual bytes of a t
 // ********************CONSTANTS (SET UP LOGGING PARAMETERS HERE!!)*******************************
 const byte checkTime = 30;                          // How long in milliseconds to check to see if a tag is present (Tag is only partially read during this time -- This is just a quick way of detirmining if a tag is present or not
 const unsigned int pollTime1 = 100;                 // How long in milliseconds to try to read a tag if a tag was initially detected (applies to both RF circuits, but that can be changed)
-const unsigned int delayTime = 8;                   // Minimim time in seconds between recording the same tag twice in a row (only applies to data logging--other operations are unaffected)
+const unsigned int delayTime = 5;                   // Minimim time in seconds between recording the same tag twice in a row (only applies to data logging--other operations are unaffected)
 const unsigned long pauseTime = 200;                // CRITICAL - This determines how long in milliseconds to wait between reading attempts. Make this wait time as long as you can and still maintain functionality (more pauseTime = more power saved)
 uint16_t pauseCountDown = pauseTime / 31.25;        // Calculate pauseTime for 32 hertz timer
 byte pauseRemainder = ((100 * pauseTime) % 3125) / 100; // Calculate a delay if the pause period must be accurate
 //byte pauseRemainder = 0 ;                         // ...or set it to zero if accuracy does not matter
 
-const byte slpH = 22;                            // When to go to sleep at night - hour
+const byte slpH = 20;                            // When to go to sleep at night - hour
 const byte slpM = 00;                            // When to go to sleep at night - minute
-const byte wakH = 05;                            // When to wake up in the morning - hour
+const byte wakH = 06;                            // When to wake up in the morning - hour
 const byte wakM = 00;                            // When to wake up in the morning - minute
 const unsigned int slpTime = slpH * 100 + slpM;  // Combined hours and minutes for sleep time
 const unsigned int wakTime = wakH * 100 + wakM;  // Combined hours and minutes for wake time
 
-const byte motorPresent = 1;
+// Global variables for motor control
+
+const byte motorPresent =  1; // Set to 0 if motor is not connected
+
+byte openSpeed = 255;     //Speed for closing door - 0 (very slow) to 255 (full speed)
+byte closeSpeed = 30;    //Speed for opening door - 0 (very slow) to 255 (full speed)
+uint16_t mPauseTime = 1;       //determines when a pause happens during opening or closing of the motorized door (ms after switch is initiated). Should be >10 and less than 300
+uint16_t mPauseDur = 0;        //determines the duration of a mid-movement pause when the motorized door is opened or closed (duration in ms).
+int timeoutMils = 2000;          //how long to try closing the door before determining failure
+
 
 /* The reader will output Serial data for a certain number of read cycles;
    then it will start using a low power sleep mode during the pauseTime between read attempts.
@@ -166,14 +192,22 @@ const byte motorPresent = 1;
    Once low-power sleep is enabled, the reader will not be able to output
    serial data, but tag reading and data storage will still work.
 */
-unsigned int cycleCount = 0;          // counts read cycles
+unsigned int cycleCount = 0;             // counts read cycles
 unsigned int stopCycleCount = 50000;     // How many read cycles to maintain serial comminications
-bool Debug = 1;                       // Use to stop serial messages once sleep mode is used.
-byte SDOK = 1;
+bool Debug = 0;                          // Use to stop serial messages once sleep mode is used.
+                                         // UPDATED: now turns ON serial if logging is started from menu; it's off by default
+byte SDOK = 1;                           // Monitor whether SD card is working 
+byte GPSFirstRead = 0;                   // Has the GPS been read yet during this power cycle?
 char logMode;
 
-byte doorState = 1;                              //Status of the motorized door. 0 = open, 1 = closed.
+byte doorState = 1;                      //Status of the motorized door. 0 = open, 1 = closed.
 byte birdFed = 0;
+byte doorAttempts = 0;
+bool closeSuccess = true;
+byte keepOpen = 0;                       // For tracking birds that arrive during pause in Target
+
+byte closeWaitCounter = 0;
+byte closeWait = 3;  // goal is ~400 ms 
 
 //GPS variables
 uint32_t timeVal; //For GPS
@@ -231,39 +265,37 @@ void setup() {  // setup code goes here, it is run once before anything else
 
   blinkLED(LED_RFID, 4, 400);     // blink LED to provide a delay for serial comms to come online
   serial.begin(9600);
-  serial.println("Start");
+  serial.println(F("Start"));
 
   //Check flash memory and initialize if needed
-  serial.print("Is flash memory initialized? ");    //It is neccessary to initialize the flash memory on the first startup
+  serial.print(F("Is flash memory initialized? "));    //It is neccessary to initialize the flash memory on the first startup
   byte byte0 = readFlashByte(0, 3);                 //Read a particular byte from the flash memory
   if (byte0 != 0xAA) {                              //If the byte is 0xFF then the flash memory needs to be initialized
-    serial.println("NO!");                          //Message
-    serial.println("Initializing Flash Memory..."); //Message
+    serial.println(F("NO!"));                          //Message
+    serial.println(F("Initializing Flash Memory...")); //Message
     writeFlashByte(0, 3, 0xAA);                     //Write a different byte to this memory location
-    serial.println("Setting default device ID - Please update this!!!");
+    serial.println(F("Setting default device ID - Please update this!!!"));
     deviceID[0] = 'R'; deviceID[1] = 'F'; deviceID[2] = '0'; deviceID[3] = '1';
     writeFlashArray(0, 4, deviceID, 4);  //write to flash memory without updating flash address
   } else {
-    serial.println("YES");                          //Confirm initialization
+    serial.println(F("YES"));                          //Confirm initialization
   }
 
   // Set up SD card communication
-  serial.println("Initializing SD card...");       // message to user
-  if (SDwriteString("Message", "DUMMY.TXT")) {   // Write a dummy file to the SD card
-    serial.println("SD card OK");                // OK message
-    SDremoveFile("DUMMY.TXT");                   // delete the dummy file
-    if (logMode == 'F') {
-      writeMem(0); //Write flash memory
-    }
+
+  logMode = readFlashByte(0, 0x0D); // Get log mode from flash mem so we know if it matters!
+   
+  serial.println(F("Initializing SD card..."));       // message to user
+  if (SDwriteString("Message", "DUMMY.TXT")) {        // Write a dummy file to the SD card
+    serial.println(F("SD card OK"));                  // OK message
+    SDremoveFile("DUMMY.TXT");                        // delete the dummy file
+    if (logMode == 'F') {writeMem(0);}                // Write flash memory
   } else {
-    serial.println("SD card not detected.");       // error message
+    serial.println(F("SD card not detected."));       // error message
     if (logMode == 'S') {
-      ;
-      for (byte i = 0; i < 4; i++) {
-        serial.println("SD card not detected.");       // error message
-        blinkLED(LED_RFID, 1, 1000);                 // LED on for warning
-        SDOK = 2;                       //indicates SD card not detected
-      }
+        serial.println(F("SD card not detected."));       // error message
+        blinkLED(LED_RFID, 8, 200);                       // LED on for warning
+        SDOK = 2;                                         //indicates SD card not detected
     }
   }
 
@@ -271,7 +303,7 @@ void setup() {  // setup code goes here, it is run once before anything else
   // start clock functions and check time
   Wire.begin();  //Start I2C bus to communicate with clock.
   if (rtc.begin() == false) {  // Try initiation and report if something is wrong
-    serial.println("Something wrong with clock");
+    serial.println(F("Something wrong with clock"));
   } else {
     rtc.set24Hour();
   }
@@ -280,19 +312,19 @@ void setup() {  // setup code goes here, it is run once before anything else
     String loadFile = checkForLoadFile();
     serial.println(loadFile);
     if (loadFile != "na") {
-      serial.println("Loading new parameters...");
+      serial.println(F("Loading new parameters..."));
       loadParameters(loadFile);
 
       readFlashArray(0, 4, deviceID, 4);   //Read in device ID
       deviceIDstr = String(deviceID);
 
       String tagFile = String(deviceIDstr +  "TAGS.TXT");
-      serial.print("Updating tag lists from ");
+      serial.print(F("Updating tag lists from "));
       serial.println(tagFile);
       transferTags(tagFile, 1);
 
       String timeFile = String(deviceIDstr +  "TIME.TXT");
-      serial.print("Updating switch times from ");
+      serial.print(F("Updating switch times from "));
       serial.println(timeFile);
       transferTimes(timeFile, 17);
 
@@ -314,10 +346,11 @@ void setup() {  // setup code goes here, it is run once before anything else
   fAddr = FlashGetAddr(12);
   //fMemPageAddr <- fAddr >> 10
   //fMemByteAddr <- fAddr & 0xFFFFF
+  serial.println(F(""));
 
   logMode = readFlashByte(0, 0x0D);
   if (logMode != 'S' & logMode != 'F') { //If log mode is not established then do so
-    serial.println("Setting log mode to SD card");
+    serial.println(F("Setting log mode to SD card"));
     writeFlashByte(0, 0x0D, 0x53);    //hex 53 is "S"
     logMode = 'S';
     //serial.println("Setting log mode to Flash mode");
@@ -325,11 +358,11 @@ void setup() {  // setup code goes here, it is run once before anything else
     //logMode = 'F';
   }
   if (logMode == 'S') {
-    serial.println("Logging mode S");
-    serial.println("Data saved immediately SD card and Flash Mem");
+    serial.println(F("Logging mode S"));
+    serial.println(F("Data saved immediately to SD card and Flash Mem"));
   } else {
-    serial.println("Logging mode F");
-    serial.println("Data saved to Flash Mem only (no SD card needed)");
+    serial.println(F("Logging mode F"));
+    serial.println(F("Data saved to Flash Mem only (no SD card needed)"));
     SDOK = 0;     //Turns off SD logging
   }
 
@@ -342,21 +375,25 @@ void setup() {  // setup code goes here, it is run once before anything else
   //////////////MENU////read1 = myfile.read()////////MENU////////////MENU////////////MENU////////
   //Display all of the following each time the main menu is called up.
 
-
-
-
   byte menu = 1;
   while (menu == 1) {
+    
+    serial.println();
+    serial.println(F("VERSION 2.6"));
+    serial.println(F("Door pause, excludes scroungers"));
+    
     serial.println();
     rtc.updateTime();
     serial.println(showTime());
 
-    serial.println("Device ID: " + String(deviceID)); //Display device ID
-    serial.println("Logging mode: " + String(logMode)); //Display logging mode
+    serial.print(F("Device ID: ")); //Display device ID
+    serial.println(String(deviceID));
+    serial.print(F("Logging mode: ")); //Display logging mode
+    serial.println(String(logMode));
 
-    serial.print("Flash memory address: Page ");      //Display flash memory address
+    serial.print(F("Flash memory address: Page "));      //Display flash memory address
     serial.print(fMemPageAddr, DEC);
-    serial.print(" - Byte ");
+    serial.print(F(" - Byte "));
     serial.println(fMemByteAddr, DEC);
 
     feedMode = getMode();                    //Get and show the feeder mode stored in the flash memory.
@@ -364,7 +401,8 @@ void setup() {  // setup code goes here, it is run once before anything else
     //  feedMode = 'A';
     //  feedMode = setMode('A');
     // }
-    serial.println("Feeding mode: " + String(feedMode));
+    serial.print(F("Feeding mode: "));
+    serial.println(String(feedMode));
 
     //tagCount = readFlashByte(0, 09);       //Get tag count from flash memory
     //serial.println("Tags in memory: " + String(tagCount));
@@ -374,10 +412,18 @@ void setup() {  // setup code goes here, it is run once before anything else
       timeCalFreq = 999;
     }
     if (timeCalFreq == 999) {
-      serial.println("GPS time update: OFF");
+      serial.println(F("GPS time update: OFF"));
     } else {
-      serial.println("GPS time update: Every " + String(timeCalFreq) + " minutes");
+      serial.print(F("GPS time update: Every "));
+      serial.print(String(timeCalFreq));
+      serial.println(F(" minutes"));
     }
+
+    // Display delay time
+    serial.print(F("Delay time: "));
+    serial.print(String(delayTime));
+    serial.println(F(" seconds"));
+    
     //Define the log and data files
     deviceIDstr = String(deviceID);
     logFile = String(deviceIDstr +  "LOG.TXT");
@@ -385,27 +431,29 @@ void setup() {  // setup code goes here, it is run once before anything else
 
 
     // Ask the user for instruction and display the options
-    serial.println("What to do? (input capital letters)");
-    serial.println("    B = Display backup memory");
-    serial.println("    C = set clock");
-    serial.println("    D = test Door");
-    serial.println("    E = Erase (reset) backup memory");
-    serial.println("    G = GPS functions");
-    serial.println("    I = Set device ID");
-    serial.println("    L = Load Tag IDs");                //Transfer tag IDs from a file on the SD card to the flash memory.
-    serial.println("    M = Change logging mode");
-    serial.println("    S = Show current Tag IDs");
-    serial.println("    W = Write flash data to SD card");
-    serial.println("    O, A, T = Feed modes: Open, All, Target");
+    serial.println(F("---"));
+    serial.println(F("What to do? (input capital letters)"));
+    serial.println(F("    B = Display backup memory"));
+    serial.println(F("    C = set clock"));
+    serial.println(F("    D = test Door"));
+    serial.println(F("    E = Erase (reset) backup memory"));
+    serial.println(F("    G = GPS functions"));
+    serial.println(F("    I = Set device ID"));
+    serial.println(F("    L = Load Tag IDs"));                //Transfer tag IDs from a file on the SD card to the flash memory.
+    serial.println(F("    M = Change logging mode"));
+    serial.println(F("    S = Show current Tag IDs"));
+    serial.println(F("    W = Write flash data to SD card"));
+    serial.println(F("    O, A, T = Feed modes: Open, All, Target"));
 
 
     //Get input from user or wait for timeout
-    char incomingByte = getInputByte(15000);
+    char incomingByte = getInputByte(12000);
     String printThis = String("Value recieved: ") + incomingByte;
     serial.println(printThis);
     switch (incomingByte) {                                               // execute whatever option the user selected
       default:
-        menu = 0;         //Any non-listed entries - set menu to 0 and break from switch function. Move on to logging data
+        menu = 0;         // Any non-listed entries - set menu to 0 and break from switch function. Move on to logging data
+        Debug = 1;        // turn on debugging
         break;
       case 'A': {
           feedMode = setMode('A');  //set feeder mode to A: feed all tagged birds; break and show menu again
@@ -425,10 +473,10 @@ void setup() {  // setup code goes here, it is run once before anything else
           rtc.updateTime();
           updateTimeVars();
           readTimes(makeUnixTime(yr, mo, da, hh, mm, ss), 0);
-          serial.print("Current group selection ");
+          serial.print(F("Current group selection "));
           printBits(tagGrpSel, 16, 1);
           serial.println();
-          serial.print("Time for next tag group ");
+          serial.print(F("Time for next tag group "));
           extractUnixTime(nextTime);
           char dateLine[20];
           sprintf(dateLine, "%02d/%02d/%02d %02d:%02d:%02d ",
@@ -442,7 +490,7 @@ void setup() {  // setup code goes here, it is run once before anything else
           }
           delay(1000);
           if (motorPresent) {
-            doorClose();
+            doorClose(closeSpeed, mPauseTime, mPauseDur);
           }
           break;
         }
@@ -530,10 +578,10 @@ void setup() {  // setup code goes here, it is run once before anything else
           updateTimeVars();
           serial.println(showTime());
           readTimes(makeUnixTime(yr, mo, da, hh, mm, ss), 0);
-          serial.print("Current group selection ");
+          serial.print(F("Current group selection "));
           printBits(tagGrpSel, 16, 1);
           serial.println();
-          serial.print("Time for next tag group ");
+          serial.print(F("Time for next tag group "));
           extractUnixTime(nextTime);
           char dateLine[20];
           sprintf(dateLine, "%02d/%02d/%02d %02d:%02d:%02d ",
@@ -545,19 +593,19 @@ void setup() {  // setup code goes here, it is run once before anything else
           logMode = readFlashByte(0, 0x0D);
           if (logMode != 'S') {
             writeFlashByte(0, 0x0D, 0x53);    //hex 53 is "S"
-            serial.println("Logging mode S");
-            serial.println("Data saved immediately SD card and Flash Mem");
+            serial.println(F("Logging mode S"));
+            serial.println(F("Data saved immediately to SD card and Flash Mem"));
             if (SDOK == 0) {
               SDOK = 1;
             }
           } else {
             writeFlashByte(0, 0x0D, 0x46);    //hex 46 is "F"
-            serial.println("Logging mode F");
-            serial.println("Data saved to Flash Mem only (no SD card needed)");
+            serial.println(F("Logging mode F"));
+            serial.println(F("Data saved to Flash Mem only (no SD card needed)"));
             SDOK = 0;
           }
           logMode = readFlashByte(0, 0x0D);
-          serial.println("log mode set to: ");
+          serial.println(F("log mode set to: "));
           serial.println(logMode);
           break;       //  break out of this option, menu variable still equals 1 so the menu will display again
         }
@@ -571,7 +619,7 @@ void setup() {  // setup code goes here, it is run once before anything else
             showTags(pg);
           }
 
-          serial.println("Switch times:");
+          serial.println(F("Switch times:"));
           serial.println();         
 
           showReadTimes();
@@ -581,16 +629,16 @@ void setup() {  // setup code goes here, it is run once before anything else
           uint32_t tNow = makeUnixTime(yr, mo, da, hh, mm, ss);
           readTimes(tNow, 1);
           serial.println();
-          serial.print("Current list selection ");
+          serial.print(F("Current list selection "));
           printBits(tagGrpSel, 16, 1);
           serial.println();
-          serial.print("Next switch at ");
+          serial.print(F("Next switch at "));
           extractUnixTime(nextTime);
           char dateLine3[20];
           sprintf(dateLine3, "%02d/%02d/%02d %02d:%02d:%02d",
               mo, da, yr, hh, mm, ss);
           serial.print(dateLine3);
-          serial.print(" to ");
+          serial.print(F(" to "));
           printBits(nextGrpSel, 16, 1);
           serial.println();
           break;
@@ -605,7 +653,7 @@ void setup() {  // setup code goes here, it is run once before anything else
           if (SDOK == 1) {
             writeMem(0);
           } else {
-            serial.println("SD card missing");
+            serial.println(F("SD card missing"));
           }
           break;       //  break out of this option, menu variable still equals 1 so the menu will display again
         }
@@ -613,15 +661,29 @@ void setup() {  // setup code goes here, it is run once before anything else
   } //end of while(menu = 1){
 
   rtc.updateTime();
+  
+  // Record that logging has begun
   String logStr = "Logging started at " + showTime();
-  if (SDOK == 1) {
-    SDwriteString(logStr, logFile);
-  }
+  if (SDOK == 1) SDwriteString(logStr, logFile);
+  char flashData[13] = {0, 0x11, 0x11, 0x11, 0x11, 0x11,              // Create an array representing an entire line of data
+                        rtc.getMonth(), rtc.getDate(), rtc.getYear(), rtc.getHours(),
+                        rtc.getMinutes(), rtc.getSeconds()
+                          };
+  writeFlashArray(fMemPageAddr, fMemByteAddr, flashData, 12);  //write array
+  advanceFlashAddr2(12);
   RFcircuit = 1;
   birdFed = 0;                 //birdFed default is 0
   blinkLED(LED_RFID, 3, 100);
   pastTime = 0;
   calFreq = timeCalFreq;
+
+  // open the door if it's in open mode
+  if (feedMode == 'O') {
+        if (motorPresent) {
+        doorOpen();                                   // Just open the door if the motor is active
+        birdFed = 1;                                  // set birdFed varible to 1 to indicate that the bird was given food access.
+      }
+     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -651,20 +713,6 @@ void loop() { // Main code is here, it loops forever:
   //    serial.print("   ")  ;
   //    serial.println(pastTime);
   //  }
-//
-//
-//
-//
-//
-//
-//  serial.print("curTime ");
-//  serial.print(curTime);
-//    serial.print("    nextTime ");
-//  serial.print(nextTime);
-//      serial.print("    tagGrpSel ");
-//  serial.println(tagGrpSel, BIN);
-//
-//
 
   if (curTime >= nextTime) {
     readTimes(curTime, 1);  //Switch tag lists.
@@ -679,27 +727,17 @@ void loop() { // Main code is here, it loops forever:
       SDwriteString(SDsaveString, logFile); //Write log to SD card
     }
     if (Debug) {
-      serial.print("Next switch at ");
+      serial.print(F("Next switch at "));
       extractUnixTime(nextTime);
       char dateLine2[20];
       sprintf(dateLine2, "%02d/%02d/%02d %02d:%02d:%02d",
               mo, da, yr, hh, mm, ss);
       serial.print(dateLine2);
-      serial.print(" to ");
+      serial.print(F(" to "));
       printBits(nextGrpSel, 16, 1);
       serial.println();
     }
   }
-
-
-
-
-
-
-
-
-
-
 
 
   if ((curTime - pastTime) / 60 >= calFreq & GPSstatus == 0 & calFreq != 999) { //calculate difference in minutes between current time and past time to see if it is time to check the GPS for a time update
@@ -709,6 +747,7 @@ void loop() { // Main code is here, it loops forever:
     //if(Debug) {
     //serial.print(F("GPS timing started: ")); //indicate when aquisition started
     //serial.println(GPSacquireA, DEC);}
+    pastTime = curTime;
     GPSstatus = 1;                        //Set GPS status to 1 to indicate that aquisition is in progress
     timeVal = 0;
     dateVal = 0;
@@ -721,9 +760,9 @@ void loop() { // Main code is here, it loops forever:
   if (GPSstatus > 0) {   //Do this whenever GPS status is 1 or 2
     if (Debug) {
       uint32_t timeOn  = curTime - GPSacquireA;
-      serial.print("GPS aquisition active for ");   //Serial message
+      serial.print(F("GPS aquisition active for "));   //Serial message
       serial.print(timeOn, DEC);
-      serial.println(" secs");
+      serial.println(F(" secs"));
     }
     parseGPS(millis() + pauseTime);
     //      if(Debug) {
@@ -794,7 +833,7 @@ void loop() { // Main code is here, it loops forever:
       }
     }
     currentDate = rtc.stringDateUSA(); //Get the current date in mm/dd/yyyy format (we're weird in the US)
-    currentTime = rtc.stringTime(); //Get the time
+    currentTime = rtc.stringTime();   //Get the time
     currentDateTime = currentDate + " " + currentTime ;
     GPSoff();                             //Turn GPS off in case it is on
     GPSstatus = 0;                        //End GPS read attempt
@@ -819,13 +858,31 @@ void loop() { // Main code is here, it loops forever:
     //          timeLogStr = "Bad date recieved from GPS. Time not updated.";
     //      }
     curTime = makeUnixTime(yr, mo, da, hh, mm, ss);                  // returns a unix time value based on the RTC values
-    //if(SDOK==1) {saveLogSD(timeLogStr);}
     currentDate = rtc.stringDateUSA();                               // Get the current date in mm/dd/yyyy format (we're weird in the US)
     currentTime = rtc.stringTime(); //Get the time
     SDsaveString = timeLogStr  + currentDate + " " + currentTime;    // Create a data string
     if (SDOK == 1) {
       SDwriteString(SDsaveString, logFile); // Write log to SD card
     }
+
+    // Force an update of the tag lists the first time the GPS reads
+    if (GPSFirstRead == 0) {
+    updateTimeVars();
+    readTimes(makeUnixTime(yr, mo, da, hh, mm, ss), 0);
+    if (Debug) {
+      serial.println();
+    }
+    printBits(tagGrpSel, 16, 0);
+    SDsaveString = String("List selection updated to ") + 
+      selBits + " at " + currentDate + " " + currentTime;    // Create a data string
+    if (SDOK == 1) {
+      if (Debug) {serial.println(SDsaveString);}
+      SDwriteString(SDsaveString, logFile); //Write log to SD card
+    }
+    blinkLED(LED_RFID, 3, 100);
+    GPSFirstRead = 1;
+    }
+
     pastTime = curTime;
     char flashData[13] = {0, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,           // Create an array representing an entire line of data
                           rtc.getMonth(), rtc.getDate(), rtc.getYear(),
@@ -841,7 +898,7 @@ void loop() { // Main code is here, it loops forever:
   //Check to see if it is time to execute nightime sleep mode.
 
   rtc.updateTime();                                            // Get an update from the real time clock
-  if (Debug) serial.println(showTime());                       // Show the current time
+  if (Debug) {serial.println(showTime());}                     // Show the current time
   int curTimeHHMM = rtc.getHours() * 100 + rtc.getMinutes();   // Combine hours and minutes into one variable
   if (curTimeHHMM == slpTime) {                                // Check to see if it is sleep time
     String SlpStr =  "Entering sleep mode at " + showTime();  // if it's time to sleep make a log message
@@ -875,56 +932,42 @@ void loop() { // Main code is here, it loops forever:
   //////Read Tags//////////////Read Tags//////////
 
   //Try to read tags - if a tag is read and it is not a recent repeat, write the data to the SD card and the backup memory.
-
-
+  
   if (FastRead(RFcircuit, checkTime, pollTime1) == 1) {
     processTag(RFIDtagArray, RFIDstring, RFIDtagUser, &RFIDtagNumber);    // Parse tag data into string and hexidecimal formats
     rtc.updateTime();                                                     // Update time from clock
-    if (feedMode == 'A' & doorState == 1) {           // Do the following in feed-All mode
-      if (motorPresent) {
-        doorOpen();                                   // Just open the door if the motor is active
+    if (feedMode == 'A') {                            // Do the following in feed-All mode
+      if (motorPresent) doorOpen();                   // Just open the door if the motor is active; doorOpen function checks door status already
         birdFed = 1;                                  // set birdFed varible to 1 to indicate that the bird was given food access.
-      }
     }
-    if (feedMode == 'T'  & doorState == 1) {          // Do the following in Target mode
+    if (feedMode == 'O') {
+       birdFed = 1; // If the feed mode is Open, then birdFed needs to be set to 1
+    }
+    if (feedMode == 'T') {                            // Do the following in Target mode
       byte tagFound = 0;                              // Initialize tag found varible - indicates if tag read matches something in a list
       byte checkPage = 1;                             // first page of tag lists
       uint16_t andInt = 0xFFFF;                       // value used for bitwise and calculation
       for (byte c = 16; c > 0; c--) {                 // Start a for loop to look through all the tags lists indicated in tagGrpSel
-        if ((tagGrpSel & andInt) == 0) {
-          break; // Exit loop if no more 1s remain in tagGrpSel.
-        }
-        uint16_t testBit = (1 << (c - 1)) & tagGrpSel; // See if the current list is indicated in tagGrpSel
-        if (testBit > 0) {
-          tagFound = checkTag(RFIDtagNumber, checkPage); // If the list is indicated check the corresponding page for a match
-        }
-        if (tagFound) {
-          if (Debug) serial.println("tag found!!!");  // If a match is found, print a message
-          break;
-        }                                     // If a match is found exit the loop
+        if ((tagGrpSel & andInt) == 0) {break;} // Exit loop if no more 1s remain in tagGrpSel.
+        uint16_t testBit = (1 << (c - 1)) & tagGrpSel;                  // See if the current list is indicated in tagGrpSel
+        if (testBit > 0) tagFound = checkTag(RFIDtagNumber, checkPage); // If the list is indicated check the corresponding page for a match
+        if (tagFound) {break;}                        // If a match is found exit the loop
         checkPage++;                                  // advance to next page
         andInt = andInt >> 1;                         // update and mask variable -- shift down a bit
       }
       if (tagFound) {
-        if (motorPresent) {
-          doorOpen();                                 // if a match is found and the motor is working, open the door.
-          birdFed = 1;                                // set birdFed varible to 1 to indicate that the bird was given food access.
-        }
+        if (Debug) serial.println(F("tag found!!!"));   // print a message
+        if (motorPresent) {doorOpen();}                 // if a match is found and the motor is working, open the door.
+        birdFed = 1;                                    // set birdFed varible to 1 to indicate that the bird was given food access.
       }
     }
     uint32_t tagNo = RFIDtagNumber;                                                              // Set a temporary value for tag number
-    //SDsaveString = String(RFIDstring) + ", " + RFcircuit + ", " + showTime();                  // Create a data string for SD write
     SDsaveString = String(RFIDstring) + " " + showTime() + " " + birdFed;                        // Create a data string for SD write
-    if (Debug) serial.println(SDsaveString);                                                     // Print the data string to serial output
+    if (Debug) {serial.println(SDsaveString);}                                                   // Print the data string to serial output
     currRFID = String(RFIDstring) + String(RFcircuit);                                           // Combine RFID and RFcircuit into a string to compare with future reads.
     uint32_t HHMMSS = rtc.getHours() * 10000 + rtc.getMinutes() * 100 + rtc.getSeconds();        // Creat a human readable time value
-    if (currRFID != pastRFID  | (HHMMSS - pastHHMMSS >= delayTime)) {                            // See if the tag read is a recent repeat
-      if (SDOK == 1) {
-        SDwriteString(SDsaveString, dataFile); // If it's a new read, save to the SD card
-      }
-      if (feedMode == 'O') {
-        birdFed = 1; // If the feed mode is Open, then birdFed needs to be set to 1
-      }
+    if (currRFID != pastRFID  || (HHMMSS - pastHHMMSS >= delayTime)) {                            // See if the tag read is a recent repeat
+      if (SDOK == 1) SDwriteString(SDsaveString, dataFile);                                       // If it's a new read, save to the SD card
       byte circuit_fed = (RFcircuit << 4) + birdFed;
       char flashData[13] = {circuit_fed, RFIDtagArray[0], RFIDtagArray[1], RFIDtagArray[2],      // Create an array representing an entire line of data
                             RFIDtagArray[3], RFIDtagArray[4], rtc.getMonth(), rtc.getDate(),
@@ -935,21 +978,22 @@ void loop() { // Main code is here, it loops forever:
       pastRFID = currRFID;                                                              // Update past RFID to check for repeats
       pastHHMMSS = HHMMSS;                                                              // Update pastHHMMSS to check for repeats
       if (Debug) {
-        serial.println("Data logged.");      //Output message
+        serial.println(F("Data logged."));      //Output message
         serial.println(SDsaveString);        //Output message
         serial.println();                    //Output message
       }
     } else {
-      if (Debug) serial.println("Repeat - Data not logged");                            // Output message to indicate repeats (no data logged)
+      if (Debug) serial.println(F("Repeat - Data not logged"));                            // Output message to indicate repeats (no data logged)
     }
 
     uint32_t tagNo2 = tagNo;                       // make a copy of current RFID number and antenna no.
-
-    //Wait for tag to leave
-    while (tagNo2 == tagNo) {                      // Continually check to see if tag number changes (or if a tag is not read)
-      if (FastRead(RFcircuit, 100, 200) == 0) {    // Use slightly longer check and poll times used here...
-        tagNo2 = 0xFFFFFFFF;                       // clear tagNo if no tag is read - this will exit the while loop when no tag is read
-        if (Debug) serial.println(F("tag gone ")); // Output message
+    uint32_t tagOG  = tagNo;                       // and another copy
+ 
+  //Wait for tag to leave
+    while (tagNo2 == tagNo) {                        // Continually check to see if tag number changes (or if a tag is not read)
+      if (FastRead(RFcircuit, 100, 200) == 0) {      // Use slightly longer check and poll times used here...
+        tagNo2 = 0xFFFFFFFF;                         // clear tagNo if no tag is read - this will exit the while loop when no tag is read
+        if (Debug) {serial.println(F("tag gone "));} // Output message
       } else {
         processTag(RFIDtagArray, RFIDstring, RFIDtagUser, &RFIDtagNumber);   // Tag read (probably same as before) - process to parse data
         tagNo = RFIDtagNumber;                                               // Reset current tag ID
@@ -957,18 +1001,68 @@ void loop() { // Main code is here, it loops forever:
           serial.print(F("tag still present "));     //Output message
           serial.println(tagNo, HEX);                //Output message
         }
-      }
+       }
       delay(100);
     }
-
-    if (feedMode != 'O') {     // close the door if it needs closing
+ 
+  // Either the bird is gone for good or there's a different tag present
+  // Wait for a moment to see if original bird reconnects...
+  if (feedMode != 'O' && doorState == 0) {                     // If it's All/Target and the door is open...
+    while (closeWaitCounter < closeWait) {
+      if (FastRead(RFcircuit, 100, 200) == 0) {          // Tag still gone
+        closeWaitCounter++ ;                             // Increment by 1
+        if (Debug) {serial.println(F("tag gone "));}     // Output message
+      } else {                                           // There's a bird, abort closing!
+        processTag(RFIDtagArray, RFIDstring, RFIDtagUser, &RFIDtagNumber);   // Tag read - process to parse data
+        tagNo = RFIDtagNumber; 
+        if (tagOG == tagNo) {                           // The original bird is back
+            closeWaitCounter = 0;                       // Reset the counter
+            if (Debug) {serial.println(F("tag still present"));}     
+          } else {  // ----------------------------------  It's a new bird! WAT DO?                
+           if (feedMode == 'A') {
+            keepOpen == 1;                              // All mode = keep the door open
+            break;                                      // Get out of the loop
+            } 
+           if (feedMode == 'T') {                       // Target mode - close ASAP if it's a scrounger, keep open and reset if it's assigned
+             byte tagFound = 0;                              // Initialize tag found varible - indicates if tag read matches something in a list
+             byte checkPage = 1;                             // first page of tag lists
+             uint16_t andInt = 0xFFFF;                       // value used for bitwise and calculation
+             for (byte c = 16; c > 0; c--) {                 // Start a for loop to look through all the tags lists indicated in tagGrpSel
+              if ((tagGrpSel & andInt) == 0) {break;}        // Exit loop if no more 1s remain in tagGrpSel.
+              uint16_t testBit = (1 << (c - 1)) & tagGrpSel;                    // See if the current list is indicated in tagGrpSel
+              if (testBit > 0) {tagFound = checkTag(RFIDtagNumber, checkPage);} // If the list is indicated check the corresponding page for a match
+              if (tagFound) {break;}                                            // If a match is found exit the loop
+              checkPage++;                                  // Otherwise advance to next page
+              andInt = andInt >> 1;                         // update and mask variable -- shift down a bit
+              }
+             if (tagFound) {keepOpen = 1;}                // If  the bird's assigned, keep the door open through the big reset   
+             break;                                       // Done, leave the loop                               
+             }
+            }
+          }
+        delay(100);  
+      } 
+   }
+    
+    closeWaitCounter = 0;     // we're done here, either it's gone for good or a new bird has come to stay
+    
+    if (feedMode != 'O' && keepOpen == 0) {     // close the door if it needs closing
       if (motorPresent) {
-        doorClose();           // doorClose function checks to make sure door is open first.
-        birdFed = 0;           // set birdFed value back to zero
-      }
-    }
+        doorAttempts = 0;
+        doorCloseFailCheck(closeSpeed, mPauseTime, mPauseDur);           // doorClose function checks to make sure door is open first.
+        while (doorState == 0 & doorAttempts < 50) {            // uh oh, doorState 0 means door didn't close successfully!            
+          doorAttempts++;
+          forceDoorOpen();
+          delay(150);
+          doorCloseFailCheck(closeSpeed, mPauseTime, mPauseDur);  
+          }
+         }
+        }  
+    birdFed = 0;               // set birdFed value back to zero
+    keepOpen = 0;              // not holding open door anymore 
     blinkLED(LED_RFID, 2, 5);  // quick LED flash to indicate that everything worked.
   }
+
 
   //////////Pause//////////////////Pause//////////
   //After each read attempt execute a pause using either a simple delay or low power sleep mode.
@@ -1049,7 +1143,7 @@ String showTime() { //Get date and time strings and cobine into one string
 
 //Function to get user data for setting the clock
 void inputTime() {                               // Function to set the clock
-  serial.println("Enter mmddyyhhmmss");          // Ask for user input
+  serial.println(F("Enter mmddyyhhmmss"));          // Ask for user input
   String timeStr = getInputString(20000);        // Get a string of data and supply time out value
   if (timeStr.length() == 12) {                  // If the input string is the right length, then process it
     //serial.println(timeStr);                   // Show the string as entered
@@ -1060,10 +1154,10 @@ void inputTime() {                               // Function to set the clock
     byte mm = timeStr.substring(8, 10).toInt();  //Convert two ascii characters into a single decimal number
     byte ss = timeStr.substring(10, 12).toInt(); //Convert two ascii characters into a single decimal number
     if (rtc.setTime(ss, mm, hh, da, mo, yr + 2000, 1) == false) {     // attempt to set clock with input values
-      serial.println("Something went wrong setting the time");        // error message
+      serial.println(F("Something went wrong setting the time"));        // error message
     }
   } else {
-    serial.println("Time entry error");           // error message if string is the wrong lenth
+    serial.println(F("Time entry error"));           // error message if string is the wrong lenth
   }
 }
 
@@ -1367,7 +1461,7 @@ bool checkTag(unsigned long tag, unsigned int lPage) { //Check if a tag matches 
 
 // Input the device ID and write it to flash memory
 void inputID() {                                         // Function to input and set feeder ID
-  serial.println("Enter four alphanumeric characters");  // Ask for user input
+  serial.println(F("Enter four alphanumeric characters"));  // Ask for user input
   String IDStr = getInputString(10000);                  // Get input from user (specify timeout)
   if (IDStr.length() == 4) {                             // if the string is the right length...
     deviceID[0] = IDStr.charAt(0);                       // Parse the bytes in the string into a char array
@@ -1376,7 +1470,7 @@ void inputID() {                                         // Function to input an
     deviceID[3] = IDStr.charAt(3);
     writeFlashArray(0, 4, deviceID, 4);                 // Write the array to flash
   } else {
-    serial.println("Invalid ID entered");                // error message if the string is the wrong lenth
+    serial.println(F("Invalid ID entered"));                // error message if the string is the wrong lenth
   }
 }
 
@@ -1387,16 +1481,16 @@ void dumpMem(byte doAll) {                        // Display backup memory; spec
   uint16_t curByte = 0;
   char BA[12];                                    // byte array for holding data
   static char dataLine[40];                       // make an array for writing data lines
-  serial.println("Displaying backup memory.");    // Message
+  serial.println(F("Displaying backup memory."));    // Message
   serial.println();                               // three blank lines
   serial.println();
   serial.println();
 
   serial.print(deviceIDstr);
-  serial.println("DATA.txt");
+  serial.println(F("DATA.txt"));
   while (curPage < 8193) {                 // Escape long memory dump by entering a character
     if (serial.available()) {                     // If a charcter is entered....
-      serial.println("User exit");                // ...print a message...
+      serial.println(F("User exit"));                // ...print a message...
       break;                                      // ...and exit the loop
     }
     readFlashArray(curPage, curByte, BA, 12);              // read a line of data (12 bytes)
@@ -1422,11 +1516,11 @@ void dumpMem(byte doAll) {                        // Display backup memory; spec
 
 void eraseBackup(char eMode) {  //erase chip and replace stored info
   //first erase pages 2 through 7
-  serial.print("Erasing flash with mode ");
+  serial.print(F("Erasing flash with mode "));
   serial.println(eMode);
   //uint16_t pageAddr = fAddr >> 10;    // store current page address for later
   if (eMode == 'a') {
-    serial.println("This will take 80 seconds");
+    serial.println(F("This will take 80 seconds"));
     flashOn();
     SPI.transfer(0xC7);  // opcode for chip erase: C7h, 94h, 80h, and 9Ah
     SPI.transfer(0x94);
@@ -1435,12 +1529,12 @@ void eraseBackup(char eMode) {  //erase chip and replace stored info
     digitalWrite(FlashCS, HIGH);    //Deassert cs for process to start
     delay(80000);
     flashOff();                         // Turn off SPI
-    serial.println("DONE!");
-    serial.println("You must now reestablish all parameters");
+    serial.println(F("DONE!"));
+    serial.println(F("You must now reestablish all parameters"));
     return;
   }
   if (eMode == 's') {
-    serial.println("Seek and destroy!!");
+    serial.println(F("Seek and destroy!!"));
     uint16_t pageAddr = dataStartPage;
     while (pageAddr < 8192) {                   //Max number of pages = 8192
       byte rByte = readFlashByte(pageAddr, 0);  //check first byte of each page
@@ -1457,7 +1551,7 @@ void eraseBackup(char eMode) {  //erase chip and replace stored info
     }
   }
   if (eMode == 'f') {
-    serial.println("Fast erase.");
+    serial.println(F("Fast erase."));
     //pageAddr = (fAddr >> 10) & 0x1FFF;
   }
   //serial.print("erasing through page ");
@@ -1495,12 +1589,11 @@ void pageErase(uint16_t pageAddr) {
 }
 
 
-
 void writeMem(byte doAll) {       //write backup data to SD card, specify end of data
   String BakupFileName = String(deviceID) + "BKUP.TXT";
   File dataFile;
   SDstart();
-  serial.print("Writing flash to SD card to ");
+  serial.print(F("Writing flash to SD card to "));
   serial.println(BakupFileName);
 
   if (!SD.exists(BakupFileName)) {
@@ -1527,14 +1620,15 @@ void writeMem(byte doAll) {       //write backup data to SD card, specify end of
     SPI.transfer((fAddress >> 8) & 0xFF);         // second address byte
     SPI.transfer(fAddress & 0xFF);                // third address byte
     for (int n = 0; n < 527; n++) {             // loop to read in an RFID code from the flash and send it out via serial comm
-      mBytes[n] = SPI.transfer(0);          //read in 528 bytes
-      //serial.print(mBytes[n]);
+      mBytes[n] = SPI.transfer(0);          //read in 528 bytes      
     }
+    
     digitalWrite(LED_RFID, HIGH);
     flashOff();
-    if (mBytes[0] = 255 & doAll == 0) {     //No data in next page - stop transfer.
+    if (mBytes[0] == 255 & doAll == 0) {     //No data in next page - stop transfer.
+      serial.println(F("Page empty, stopping transfer"));
       break;
-      curPAddr = 9000;  //probably unnecessary.
+      // curPAddr = 9000;  //probably unnecessary.
     }
 
 
@@ -1544,14 +1638,15 @@ void writeMem(byte doAll) {       //write backup data to SD card, specify end of
     dataFile = SD.open(BakupFileName, FILE_WRITE);        //Initialize the SD card and open the file "datalog.txt" or create it if it is not there.
     if (dataFile) {
       for (int i = 0; i < 527; i = i + 12) {         // loop to read in an RFID code from the flash and send it out via serial comm
-        if (i != 255 | doAll != 0) {                // only write data if it exists
+        // serial.println(mBytes[i]);
+        if (mBytes[i] != 255 | doAll != 0) {                // only write data if it exists
           static char charRFID[10];
           sprintf(charRFID, "%02X%02X%02X%02X%02X", mBytes[i + 1], mBytes[i + 2], mBytes[i + 3], mBytes[i + 4], mBytes[i + 5]); //skip i (rf circuit)
           static char dateAndTime[17];
           sprintf(dateAndTime, "%02d/%02d/%02d %02d:%02d:%02d", mBytes[i + 6], mBytes[i + 7], mBytes[i + 8], mBytes[i + 9], mBytes[i + 10], mBytes[i + 11]); //note order switched....+8 then +7
           wStr = String(charRFID) + " " + String(dateAndTime);
           dataFile.println(wStr);
-          //serial.println(wStr);
+          // serial.println(wStr);
         }
       }
       dataFile.close();      //close the file
@@ -1568,7 +1663,7 @@ void showTags(uint16_t pageAddr) {      //display tags in flash memory (specify 
   if (tagCount != 255) {
     serial.println();
     serial.print(tagCount, DEC);
-    serial.print(" tags currently in list ");
+    serial.print(F(" tags currently in list "));
     serial.println(pageAddr, DEC);
 
     char tagArray[527];
@@ -1613,10 +1708,10 @@ byte FlashGetAddr(uint8_t spacing) {
   uint16_t pageAddr = dataStartPage;  // page address: backup memory starts on page dataStartPage
   uint16_t byteAddr = 0;          // byte address; start where first written byte might be
   byte rByte = 0;
-  serial.print("Finding address ");
+  serial.print(F("Finding address "));
   //serial.println(pageAddr);
   while (pageAddr < 8192) { //Max number of pages = 8192
-    serial.print(".");
+    serial.print(F("."));
     //serial.println(pageAddr, HEX);
     rByte = readFlashByte(pageAddr, 0);
     //serial.print("byte read: ");
@@ -1682,17 +1777,17 @@ String checkForLoadFile() {
 }
 
 void loadParameters(String pFile) {
-  serial.println ("Loading parameters from file");
+  serial.println (F("Loading parameters from file"));
   SDstart();
   File myfile = SD.open(pFile);  // attempt to open the file with a list of tag numbers
   if (!myfile) {
     serial.print(pFile);
-    serial.println(" file not found");
+    serial.println(F(" file not found"));
     return;
   }
   if (myfile) {                     // if the file is available, read from it one byte at a time
     serial.print(pFile);
-    serial.println(" file found");
+    serial.println(F(" file found"));
     byte pCnt = 1;
     char read1 = 'A';
     while (myfile.available()) {
@@ -1741,7 +1836,9 @@ bool SDstart() {                 // Startup routine for the SD card
   digitalWrite(SDselect, LOW);   // SD card turned on
   if (!SD.begin(SDselect)) {     // Return a 1 if everyting works
     //serial.println("SD fail");
+    // record SD failure to Flash mem
     return 0;
+    
   } else {
     return 1;
   }
@@ -1800,12 +1897,12 @@ void transferTags(String fileName, uint16_t pageAddr) {
   File myfile = SD.open(fileName);  // attempt to open the file with a list of tag numbers
   if (!myfile) {
     serial.print(fileName);
-    serial.println(" file not found");
+    serial.println(F(" file not found"));
     return;
   }
   if (myfile) {                     // if the file is available, read from it one byte at a time
     serial.print(fileName);
-    serial.println(" file found");
+    serial.println(F(" file found"));
     while (myfile.available()) {
       char read1 = myfile.read();     //each myfile.read() operation brings in one byte (one character)
       //serial.print(read1);
@@ -1883,12 +1980,12 @@ void transferTimes(String fileName, uint16_t pageAddr) {
   File myfile = SD.open(fileName);  // attempt to open the file with a list of times and tag lists
   if (!myfile) {
     serial.print(fileName);
-    serial.println(" file not found");
+    serial.println(F(" file not found"));
     return;
   }
   if (myfile) {                      // if the file is available, read the file
     serial.print(fileName);
-    serial.println(" file found");
+    serial.println(F(" file found"));
     uint16_t writeByte = 0;
     byte rCnt = 0;
     byte bCnt = 0;
@@ -1985,6 +2082,7 @@ uint32_t readTimes(uint32_t timeNow, bool show) {
 
     if (bAddr == 0) {
       tagGrpSel = (dtA[4] << 8) + dtA[5];            //Just a placeholder... in case the first time > the current time
+      time0 = 0x00000000;
     }
     
     readFlashByteArray(17, bAddr+6, dtA, 6);   //Read in Unix time value and groupSelect
@@ -2150,7 +2248,6 @@ void parseGPS(uint32_t millisEnd) {
   //        Byte0 = Serial2.read();
   //        GPSstr2 += Byte0;
   //   }
-  //serial.println(GPSstr2);
 }
 
 
@@ -2176,7 +2273,7 @@ void setTimeCalFreq(uint16_t timeCalF) {
 ///////Motor Functions/////////////Motor Functions/////////
 
 void motInit() {  //determine initial motor position and move to closed position
-  serial.println("Initializing motor...");
+  serial.println(F("Initializing motor..."));
   byte motCount = 0;                      // count attempts to reach open position
   byte motEnd = 7;                        // limit to the number of attempts
   digitalWrite(mStby, HIGH);
@@ -2186,7 +2283,7 @@ void motInit() {  //determine initial motor position and move to closed position
     if (motDir == 0) {
       digitalWrite(MOTR, HIGH);   //Set motor to move door down
       digitalWrite(MOTL, LOW);
-      serial.print("move down...");
+      serial.print(F("move down..."));
       serial.println(motTime, DEC);
     } else  {
       digitalWrite(MOTR, LOW);   //Set motor to move door up
@@ -2204,10 +2301,11 @@ void motInit() {  //determine initial motor position and move to closed position
   if (motCount >= motEnd) {
     serial.println(F("motor failure!!!"));
     doorState = 1;
+   // motorPresent = 0;
   } else {
     doorState = 0;
     if (motorPresent) {
-      doorClose(); //if door is in the partially open position, then close it.
+      doorClose(closeSpeed, mPauseTime, mPauseDur); //if door is in the partially open position, then close it.
     }
   }
 }
@@ -2217,8 +2315,8 @@ void doorOpen() {
   //serial.println(doorState); //for debugging
   if (doorState == 1) {
     //serial.println("open"); //for debugging
-    digitalWrite(mStby, HIGH);
-    digitalWrite(MOTR, HIGH);
+    digitalWrite(mStby, HIGH); // disable standby
+    digitalWrite(MOTR, HIGH);  // set direction
     digitalWrite(MOTL, LOW);
     runMot();
     stopMot(true);
@@ -2228,22 +2326,56 @@ void doorOpen() {
   //serial.println(doorState); //for debugging
 }
 
-void doorClose() {
+// doesn't care if door is already open or not!
+void forceDoorOpen() {
+    digitalWrite(mStby, HIGH);
+    digitalWrite(MOTR, HIGH);
+    digitalWrite(MOTL, LOW);
+
+//    runMot();
+    nudgeMot(400);
+    stopMot(true);
+    doorState = 0;
+}
+
+void doorClose(byte spd, uint16_t psTime, uint16_t psDur) {
   //serial.print("door state = "); //for debugging
   //serial.println(doorState); //for debugging
   //serial.println("close"); //for debugging
   if (doorState == 0) {
     digitalWrite(mStby, HIGH);
-    digitalWrite(MOTR, LOW);  //powers up sleep....
+    digitalWrite(MOTR, LOW);  // set direction
     digitalWrite(MOTL, HIGH);
+    //runMot4(spd, psTime, psDur, timeoutMils);
     runMot();
     stopMot(true);
   }
-  doorState = 1;
-  //serial.print("door state = "); //for debugging
-  //serial.println(doorState); //for debugging
+  if (closeSuccess == true) {
+      doorState = 1;
+      // serial.println(F("Door closed successfully!"));
+  }
+
+  // serial.print("door state = "); //for debugging
+  // serial.println(doorState); //for debugging
 }
 
+void doorCloseFailCheck(byte spd, uint16_t psTime, uint16_t psDur) {
+  if (doorState == 0) {
+    digitalWrite(mStby, HIGH);
+    digitalWrite(MOTR, LOW);  // set direction
+    digitalWrite(MOTL, HIGH);
+    //runMot4(spd, psTime, psDur, timeoutMils);
+    runMotFailCheck(closeSpeed);
+    stopMot(true);
+  }
+  if (closeSuccess == true) {
+      doorState = 1;
+      // serial.println(F("Door closed successfully!"));
+  }
+
+  // serial.print("door state = "); //for debugging
+  // serial.println(doorState); //for debugging
+}
 void stopMot(bool off) {
   digitalWrite(MOTPWMA, HIGH);
   digitalWrite(MOTR, HIGH);
@@ -2262,22 +2394,23 @@ void stopMot(bool off) {
 }
 
 void pulseMot(byte pTime) {
+  //byte motSpeed = 255;
   unsigned long currentMil = millis();          //Determine how long to activate the motor - first note the current value of the millisecond counter
   unsigned long stopMil = currentMil + pTime;   //   next add the desired movement time
   while (stopMil > millis()) {                  //   As long as the stoptime is less than the current millisecond counter, then keep the motor moving
     digitalWrite(MOTPWMA, HIGH);
-    //analogWrite(MOTPWMA, motSpeed);
+     // analogWrite(MOTPWMA, 255);
     //digitalWrite(MOTPWMA, HIGH);               //Speed is determined by the ratio of the high and low pulse
     //delay(3);                                   //This delay determines the duration of the high pulse
     //digitalWrite(MOTPWMA, LOW);                //Comment this out to go full speed
-    delay(5);                                   //This delay determines the duration of the low pulse.
+    //delay(5);                                   //This delay determines the duration of the low pulse.
   }
 }
 
 void runMot() {
   pinMode(mSwitch, INPUT_PULLUP); // motor switch enabled as input with internal pullup resistor
-  unsigned long moMil = millis();
-  unsigned long moTim = moMil + 150;
+  // unsigned long moMil = millis();
+  // unsigned long moTim = moMil + 150;
   //three stage motor routine. First run the motor until the switch is closed
   byte sw = digitalRead(mSwitch);
   pulseMot(100);
@@ -2297,6 +2430,65 @@ void runMot() {
   }
   digitalWrite(MOTR, HIGH); //Apply brakes
   digitalWrite(MOTL, HIGH);
+  delay(20);
+  //serial.println();
+  //Now nudge the motor just a little farther if desired
+  //nudgeMot(100);
+}
+
+
+// Updated motor code that will attempt to retry if door is blocked
+void runMotFailCheck(byte spd) {
+
+  pinMode(mSwitch, INPUT_PULLUP); // motor switch enabled as input with internal pullup resistor
+  unsigned long runtimeMil = millis();  // millisecond counter time for function start
+  closeSuccess = false;
+  
+  //three stage motor routine. First run the motor until the switch is closed
+  byte sw = digitalRead(mSwitch);
+  pulseMot(75);
+  unsigned long startMil = millis();   //note the current value of the millisecond counter
+  while (sw == 1) {             //mSwitch high (switch open) means door is fully open or fully closed
+    if(millis() - startMil >= 50 & spd < 255) {
+      digitalWrite(MOTPWMA, LOW);
+      delay(255-spd);
+      startMil = millis();
+      digitalWrite(MOTPWMA, HIGH);
+    }
+    sw = digitalRead(mSwitch);
+    if (millis() - runtimeMil >= timeoutMils) {
+      closeSuccess = false;
+       // serial.println(F("door blocked!!"));
+       return;               // timeout, door failed, exit the function!
+    }
+  }
+
+  // Stage 2
+  // pulseMot(200);                   //pulses to get through any switch bounce
+
+  // Stage 3
+  while (sw == 0) {                    //mSwitch high (switch open) means door is fully open or fully closed
+    delay(5);
+    if(millis() - startMil >= 50 & spd < 255) {
+      digitalWrite(MOTPWMA, LOW);
+      delay(255-spd);
+      startMil = millis();
+      digitalWrite(MOTPWMA, HIGH);
+    }
+    sw = digitalRead(mSwitch);
+      if (millis() - runtimeMil >= timeoutMils) {
+       closeSuccess = false;
+       // serial.println(F("door blocked!!"));
+       return;               // timeout, door failed, exit the function!
+    }
+  }
+
+  // Stage 4
+  // Give it an extra nudge to keep the door gap the right size
+  pulseMot(50);
+  digitalWrite(MOTR, HIGH); //Apply brakes
+  digitalWrite(MOTL, HIGH);
+  closeSuccess = true;
   delay(20);
   //serial.println();
   //Now nudge the motor just a little farther if desired
